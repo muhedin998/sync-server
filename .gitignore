@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+venv-wsl/
+firebird/bin/firebird.log
+.env
