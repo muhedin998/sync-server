@@ -4,3 +4,5 @@ venv/
 venv-wsl/
 firebird/bin/firebird.log
 .env
+price_snapshot.json
+price_snapshot.json.tmp

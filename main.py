@@ -239,69 +239,116 @@ DELTA_SQL = _PRODUCT_SELECT + """
     ORDER BY a.ID
 """
 
-# ── Lookup caches (barcodes + prices) ───────────────────────────────
-
-_barcode_cache = None
-_barcode_lock  = threading.Lock()
-
-_price_cache = None
-_price_lock  = threading.Lock()
+# ── Lookup indexes (barcodes + prices) ──────────────────────────────
+#
+# NOTE: these are loaded FRESH on every sync, never cached across syncs.
+# Barcodes and prices live in their own tables and change independently of
+# the ARTIKAL row - a process-lifetime cache would serve stale data until
+# the server is restarted.
 
 def _load_all_barcodes():
     """Load all (ARTIKAL_ID, BARKOD) pairs into a dict: {artikal_id: 'barcode1 barcode2 ...'}."""
-    global _barcode_cache
-    with _barcode_lock:
-        if _barcode_cache is not None:
-            return _barcode_cache
-        log.info("Loading barcode index...")
-        t0 = time.time()
-        conn = _connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT ARTIKAL_ID, TRIM(BARKOD) as BARKOD
-                FROM ARTIKAL_BARKOD
-                WHERE (PODRAZUMVENA_VREDNOST = 1 OR PODRAZUMVENA_VREDNOST IS NULL)
-                  AND (NE_KORISTI_SE IS NULL OR NE_KORISTI_SE = 0)
-                  AND BARKOD IS NOT NULL
-                  AND BARKOD != ''
-                ORDER BY ARTIKAL_ID, PODRAZUMVENA_VREDNOST DESC NULLS LAST
-            """)
-            by_id = {}
-            for art_id, barcode in cur:
-                b = barcode.strip()
-                if art_id not in by_id:
-                    by_id[art_id] = b
-                elif b not in by_id[art_id]:
-                    by_id[art_id] += ' ' + b
-            _barcode_cache = by_id
-        finally:
-            conn.close()
-        log.info(f"Barcode index: {len(_barcode_cache)} products with barcodes in {time.time()-t0:.1f}s")
-        return _barcode_cache
+    log.info("Loading barcode index...")
+    t0 = time.time()
+    conn = _connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ARTIKAL_ID, TRIM(BARKOD) as BARKOD
+            FROM ARTIKAL_BARKOD
+            WHERE (PODRAZUMVENA_VREDNOST = 1 OR PODRAZUMVENA_VREDNOST IS NULL)
+              AND (NE_KORISTI_SE IS NULL OR NE_KORISTI_SE = 0)
+              AND BARKOD IS NOT NULL
+              AND BARKOD != ''
+            ORDER BY ARTIKAL_ID, PODRAZUMVENA_VREDNOST DESC NULLS LAST
+        """)
+        by_id = {}
+        for art_id, barcode in cur:
+            b = barcode.strip()
+            if art_id not in by_id:
+                by_id[art_id] = b
+            elif b not in by_id[art_id]:
+                by_id[art_id] += ' ' + b
+    finally:
+        conn.close()
+    log.info(f"Barcode index: {len(by_id)} products with barcodes in {time.time()-t0:.1f}s")
+    return by_id
 
 def _load_all_prices():
     """Load all (ARTIKAL_ID → price) into a dict from RM_TRENUTNO_STANJE."""
-    global _price_cache
-    with _price_lock:
-        if _price_cache is not None:
-            return _price_cache
-        log.info("Loading price index...")
-        t0 = time.time()
-        conn = _connection()
+    log.info("Loading price index...")
+    t0 = time.time()
+    conn = _connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ARTIKAL_ID,
+                   COALESCE(PROD_CENA_SA_P, PROD_CENA_BEZ_P) as CENA
+            FROM RM_TRENUTNO_STANJE
+            WHERE COALESCE(PROD_CENA_SA_P, PROD_CENA_BEZ_P) IS NOT NULL
+        """)
+        by_id = {row[0]: float(row[1]) for row in cur}
+    finally:
+        conn.close()
+    log.info(f"Price index: {len(by_id)} products with prices in {time.time()-t0:.1f}s")
+    return by_id
+
+# ── Price-change tracking ─────────────────────────────────────────────
+#
+# Prices live in RM_TRENUTNO_STANJE, a different table from ARTIKAL, and a
+# price-only change does not touch ARTIKAL.DATUM_RADA/VREME_RADA - so the
+# plain timestamp delta would never pick it up. Instead we snapshot the full
+# price map on every sync (persisted to disk so it survives restarts) and
+# force-include articles whose price changed since the previous sync.
+
+_SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "price_snapshot.json")
+_price_snapshot = None  # {artikal_id: price} from previous sync; None = unknown baseline
+_snapshot_lock = threading.Lock()
+
+
+def _load_price_snapshot():
+    """Return the previous sync's price map, or None if there is no baseline yet."""
+    global _price_snapshot
+    with _snapshot_lock:
+        if _price_snapshot is not None:
+            return _price_snapshot
         try:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT ARTIKAL_ID,
-                       COALESCE(PROD_CENA_SA_P, PROD_CENA_BEZ_P) as CENA
-                FROM RM_TRENUTNO_STANJE
-                WHERE COALESCE(PROD_CENA_SA_P, PROD_CENA_BEZ_P) IS NOT NULL
-            """)
-            _price_cache = {row[0]: row[1] for row in cur}
-        finally:
-            conn.close()
-        log.info(f"Price index: {len(_price_cache)} products with prices in {time.time()-t0:.1f}s")
-        return _price_cache
+            if os.path.isfile(_SNAPSHOT_FILE):
+                with open(_SNAPSHOT_FILE, 'r', encoding='utf-8') as f:
+                    raw = json.load(f)
+                _price_snapshot = {int(k): v for k, v in raw.items()}
+                log.info(f"Loaded price snapshot: {len(_price_snapshot)} entries")
+                return _price_snapshot
+        except Exception as e:
+            log.warning(f"Could not load price snapshot ({e}) - treating baseline as unknown")
+        return None
+
+
+def _save_price_snapshot(snapshot):
+    """Persist the current price map as the baseline for the next sync."""
+    global _price_snapshot
+    with _snapshot_lock:
+        _price_snapshot = snapshot
+        try:
+            tmp = _SNAPSHOT_FILE + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({str(k): v for k, v in snapshot.items()}, f)
+            os.replace(tmp, _SNAPSHOT_FILE)
+        except Exception as e:
+            log.warning(f"Could not save price snapshot: {e}")
+
+
+def _price_changed_ids(old, new):
+    """IDs whose price is new, changed, or removed vs the previous snapshot."""
+    changed = [i for i, price in new.items() if old.get(i) != price]
+    changed += [i for i in old if i not in new]
+    return changed
+
+
+def _chunks(seq, size):
+    """Yield successive chunks of seq."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 def _row_to_compact(r: dict, barcodes: dict, prices: dict) -> dict:
     return {
@@ -326,9 +373,12 @@ def _to_float(val):
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
 
-def _make_product_stream(sql: str, params: tuple, barcodes: dict, prices: dict, count_ref: list):
+def _make_product_stream(queries: list, barcodes: dict, prices: dict, count_ref: list):
     """
     Generator that yields gzip-compressed JSON chunks of the product array.
+
+    queries is a list of (sql, params) tuples streamed back-to-back into one
+    JSON array (delta main query + price-change follow-up chunks).
 
     Uses zlib streaming (Z_SYNC_FLUSH after each batch) so the HTTP response
     headers are sent immediately and data flows to the client as it is produced,
@@ -340,31 +390,32 @@ def _make_product_stream(sql: str, params: tuple, barcodes: dict, prices: dict, 
 
     yield cobj.compress(b'[')
 
-    for cols, batch in _iter_batches(sql, params):
-        for row in batch:
-            d = dict(zip(cols, row))
-            item = _row_to_compact(d, barcodes, prices)
-            chunk = json.dumps(item, ensure_ascii=False).encode("utf-8")
-            if not first:
-                chunk = b',' + chunk
-            else:
-                first = False
-            data = cobj.compress(chunk)
-            if data:
-                yield data
-            count_ref[0] += 1
-        # Flush after each batch so the client receives data progressively
-        flushed = cobj.flush(zlib.Z_SYNC_FLUSH)
-        if flushed:
-            yield flushed
-        del batch
+    for sql, params in queries:
+        for cols, batch in _iter_batches(sql, params):
+            for row in batch:
+                d = dict(zip(cols, row))
+                item = _row_to_compact(d, barcodes, prices)
+                chunk = json.dumps(item, ensure_ascii=False).encode("utf-8")
+                if not first:
+                    chunk = b',' + chunk
+                else:
+                    first = False
+                data = cobj.compress(chunk)
+                if data:
+                    yield data
+                count_ref[0] += 1
+            # Flush after each batch so the client receives data progressively
+            flushed = cobj.flush(zlib.Z_SYNC_FLUSH)
+            if flushed:
+                yield flushed
+            del batch
 
     yield cobj.compress(b']')
     yield cobj.flush(zlib.Z_FINISH)
 
 # ── FastAPI app ─────────────────────────────────────────────────────
 
-app = FastAPI(title="ACIS Sync Server", version="1.4.0")
+app = FastAPI(title="ACIS Sync Server", version="1.5.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -389,7 +440,7 @@ def health():
             source = "firebird"
         return {
             "status": "ok", "source": source,
-            "productCount": count, "serverVersion": "1.4.0",
+            "productCount": count, "serverVersion": "1.5.1",
             "serverTime": now_iso(),
         }
     except Exception as e:
@@ -472,6 +523,23 @@ def sync_products(
     try:
         barcodes = _load_all_barcodes()
         prices   = _load_all_prices()
+        old_snapshot = _load_price_snapshot()
+
+        # Price-only changes are invisible to the ARTIKAL timestamp delta,
+        # so diff against the previous sync's snapshot and force-include them.
+        force_full = False
+        price_changed_ids = []
+        if since:
+            if old_snapshot is None:
+                # No baseline (first run after upgrade) - send the full catalog
+                # once so no earlier price change is missed, then baseline exists.
+                log.info(f"[{client_ip}] No price baseline yet - delta will send full catalog once")
+                force_full = True
+            else:
+                price_changed_ids = _price_changed_ids(old_snapshot, prices)
+                if price_changed_ids:
+                    log.info(f"[{client_ip}] {len(price_changed_ids)} price-only changes detected")
+        _save_price_snapshot(prices)
 
         deactivated_ids = []
         if since:
@@ -492,8 +560,20 @@ def sync_products(
         log.error(f"[{client_ip}] {mode} sync pre-fetch FAILED: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    sql    = DELTA_SQL if since else FULL_SQL
-    params = (since,) if since else ()
+    if force_full or not since:
+        queries = [(FULL_SQL, ())]
+    else:
+        queries = [(DELTA_SQL, (since,))]
+        # Follow-up chunks for price-changed articles the timestamp delta missed.
+        # IDs are int()-validated so inlining them as literals is injection-safe.
+        for chunk in _chunks(price_changed_ids, 1000):
+            id_list = ",".join(str(int(i)) for i in chunk)
+            queries.append((_PRODUCT_SELECT + f"""
+    AND a.ID IN ({id_list})
+    AND NOT (COALESCE(a.DATUM_RADA || 'T' || a.VREME_RADA,
+                      '2000-01-01T00:00:00.000000') > ?)
+    ORDER BY a.ID
+""", (since,)))
     server_time = now_iso()
     count_ref   = [0]
 
@@ -501,12 +581,13 @@ def sync_products(
 
     def generate():
         try:
-            yield from _make_product_stream(sql, params, barcodes, prices, count_ref)
+            yield from _make_product_stream(queries, barcodes, prices, count_ref)
             gc.collect()
             elapsed = time.time() - t_start
             deact_info = f", {len(deactivated_ids)} deactivated" if deactivated_ids else ""
+            price_info = f", {len(price_changed_ids)} price-changed" if price_changed_ids else ""
             log.info(
-                f"[{client_ip}] {mode} sync done: {count_ref[0]} products{deact_info}"
+                f"[{client_ip}] {mode} sync done: {count_ref[0]} products{deact_info}{price_info}"
                 f" | total={elapsed:.1f}s"
             )
         except Exception as e:
@@ -517,6 +598,7 @@ def sync_products(
 
     headers = {
         "X-Deactivated-Count": str(len(deactivated_ids)),
+        "X-Price-Changed-Count": str(len(price_changed_ids)),
         "X-Server-Time": server_time,
     }
     if deactivated_ids:
@@ -545,7 +627,7 @@ def _udp_broadcast_loop():
         "name": "latko-sync",
         "ip": local_ip,
         "port": SYNC_PORT,
-        "version": "1.5.0",
+        "version": "1.5.1",
     }).encode("utf-8")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -567,7 +649,7 @@ def discover():
         "name": "latko-sync",
         "ip": _get_local_ip(),
         "port": SYNC_PORT,
-        "version": "1.5.0",
+        "version": "1.5.1",
     }
 
 
@@ -576,7 +658,7 @@ def discover():
 @app.on_event("startup")
 def startup():
     mode = "FILE" if USE_FILE else "FIREBIRD"
-    log.info(f"ACIS Sync Server v1.5.0 (mode={mode})")
+    log.info(f"ACIS Sync Server v1.5.1 (mode={mode})")
     log.info(f"Listening on {SYNC_HOST}:{SYNC_PORT}")
     log.info(f"UDP broadcast on port {BROADCAST_PORT}")
 
@@ -599,9 +681,11 @@ def startup():
             count = _fetch_one(
                 "SELECT COUNT(*) FROM ARTIKAL WHERE NE_KORISTI_SE IS NULL OR NE_KORISTI_SE = 0"
             )
-            log.info(f"Firebird connected — {count} active products")
+            log.info(f"Firebird connected - {count} active products")
             _load_all_barcodes()
             _load_all_prices()
+            if _load_price_snapshot() is None:
+                log.info("No price baseline on disk - first delta sync will send full catalog once")
         except Exception as e:
             log.warning(f"Firebird connection failed: {e}")
 
