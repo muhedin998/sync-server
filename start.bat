@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 echo ====================================
-echo   ACIS Sync Server v1.5.0
+echo   ACIS Sync Server v1.5.1
 echo   Firebird 2.5 Embedded (64-bit)
 echo ====================================
 
